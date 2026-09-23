@@ -6,8 +6,8 @@ The YOLO / Gemini / OpenAI cleanup pipeline is **not** part of this phase.
 ## How it works
 
 No Docker build is needed. The pod uses RunPod's stock **PyTorch** image, and its **Container Start Command** clones this repo from GitHub and runs `runpod_server/bootstrap.sh`. That script:
-1. creates a Python venv on the `/workspace` volume (reusing the image's PyTorch),
-2. installs `runpod_server/requirements.txt`, only on first boot or when the file changes,
+1. creates a fully isolated Python venv on the `/workspace` volume (does **not** reuse the image's preinstalled PyTorch — the model needs a newer version than most templates ship, and reusing it risks the venv's own install being silently shadowed),
+2. installs `runpod_server/requirements.txt`, only on first boot or when the file changes (and self-heals — recreates the venv from scratch — if torch ever ends up missing or older than 2.5 in it),
 3. starts the FastAPI server on port 8000. Model weights are cached in `/workspace/hf_cache`.
 
 On every pod restart, the start command runs `git pull` first, so pushing code changes to GitHub and restarting the pod is all it takes to update.
@@ -167,7 +167,7 @@ RunPod bills by the second while a pod is running.
 | Symptom | Fix |
 |---|---|
 | `ImportError: cannot import name 'QwenImage21Pipeline'` | diffusers is too old. Delete `/workspace/venv` and restart the pod to reinstall from git. |
-| `infer_schema(func): Parameter q has unsupported type torch.Tensor` at startup | The venv is using the template's old preinstalled PyTorch (< 2.5). `requirements.txt` now pins `torch>=2.5.1`; `git pull` the latest code and restart the pod so bootstrap.sh reinstalls (it does this automatically when `requirements.txt` changes). If it still shows the old torch, delete `/workspace/venv` and restart. |
+| `infer_schema(func): Parameter q has unsupported type torch.Tensor` at startup | The venv is using an old/shadowed PyTorch (< 2.5). `bootstrap.sh` now self-heals: it checks the torch version after activating the venv and automatically wipes + recreates the venv if it's missing or too old, so a crash-looping pod fixes itself within one or two auto-restarts once it has pulled this fix. Watch the logs for `torch missing or older than 2.5 in venv ... — recreating venv from scratch`. If it's still stuck after a few minutes, delete `/workspace/venv` from the web terminal and restart. |
 | `[transformers] Disabling PyTorch because PyTorch >= 2.5 is required but found ...` | Same fix as above. |
 | `CUDA out of memory` / HTTP 507 | Redeploy on a bigger GPU, or set `CPU_OFFLOAD=1` and restart. |
 | `GatedRepoError` / `401` / `403` in the logs while downloading | Add `HF_TOKEN` (see *Gated model?* above). |
