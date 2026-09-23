@@ -1,9 +1,15 @@
 # RunPod pod dependencies.
-# Pinned explicitly (not just relying on the template's preinstalled version):
-# diffusers' dev branch (needed for QwenImage21Pipeline) and transformers>=5.17
-# both require PyTorch >= 2.5 — older templates ship 2.4.x, which fails at import
-# time with "infer_schema(func): Parameter q has unsupported type torch.Tensor".
-torch>=2.5.1
+# torch/torchvision pinned to an exact CUDA 12.4 build (matching the pod
+# image's CUDA 12.4.1 toolkit) via PyTorch's own wheel index. Left
+# unconstrained, pip grabs the newest torch on PyPI, which currently bundles
+# CUDA 13.0 — newer than most pod drivers support (warns "NVIDIA driver on
+# your system is too old" and silently disables CUDA). diffusers' dev branch
+# (needed for QwenImage21Pipeline) and transformers>=5.17 both require
+# PyTorch >= 2.5 — older templates ship 2.4.x, which fails at import time
+# with "infer_schema(func): Parameter q has unsupported type torch.Tensor".
+--extra-index-url https://download.pytorch.org/whl/cu124
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
 # QwenImage21Pipeline is only in the diffusers development version (per the model card).
 git+https://github.com/huggingface/diffusers
 transformers>=5.17
