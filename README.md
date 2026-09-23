@@ -167,7 +167,8 @@ RunPod bills by the second while a pod is running.
 | Symptom | Fix |
 |---|---|
 | `ImportError: cannot import name 'QwenImage21Pipeline'` | diffusers is too old. Delete `/workspace/venv` and restart the pod to reinstall from git. |
-| Install fails with a PyTorch / transformers version conflict | The template's PyTorch is too old for `transformers>=5.17`. Redeploy with a newer `runpod/pytorch` tag, and delete `/workspace/venv`. |
+| `infer_schema(func): Parameter q has unsupported type torch.Tensor` at startup | The venv is using the template's old preinstalled PyTorch (< 2.5). `requirements.txt` now pins `torch>=2.5.1`; `git pull` the latest code and restart the pod so bootstrap.sh reinstalls (it does this automatically when `requirements.txt` changes). If it still shows the old torch, delete `/workspace/venv` and restart. |
+| `[transformers] Disabling PyTorch because PyTorch >= 2.5 is required but found ...` | Same fix as above. |
 | `CUDA out of memory` / HTTP 507 | Redeploy on a bigger GPU, or set `CPU_OFFLOAD=1` and restart. |
 | `GatedRepoError` / `401` / `403` in the logs while downloading | Add `HF_TOKEN` (see *Gated model?* above). |
 | `fatal: could not read Username` in the logs | The repo is private. Make it public or use the token URL (section 2). |
