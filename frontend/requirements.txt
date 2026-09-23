@@ -1,0 +1,3 @@
+streamlit>=1.40
+httpx
+python-dotenv>=1.0.0

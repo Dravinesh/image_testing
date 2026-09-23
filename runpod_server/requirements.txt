@@ -1,0 +1,12 @@
+# RunPod pod dependencies. PyTorch comes preinstalled with the RunPod PyTorch template (need >= 2.4).
+# QwenImage21Pipeline is only in the diffusers development version (per the model card).
+git+https://github.com/huggingface/diffusers
+transformers>=5.17
+accelerate
+safetensors
+sentencepiece
+huggingface_hub
+fastapi
+uvicorn[standard]
+python-multipart
+pillow
