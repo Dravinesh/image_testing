@@ -87,7 +87,7 @@ copy .env.example .env
    | `API_KEY` | *(empty = no auth)* | Bearer token required by `/generate`. **Recommended**, because the proxy URL is public. |
    | `HF_TOKEN` | — | Hugging Face token. Only needed if the model repo is gated. |
    | `MODEL_ID` | `Qwen/Qwen-Image-2.1` | HF model id. |
-   | `CPU_OFFLOAD` | `0` | `1` enables `enable_model_cpu_offload()` for lower VRAM. |
+   | `CPU_OFFLOAD` | `0` | `1` enables `enable_model_cpu_offload()` for lower VRAM. `sequential` enables `enable_sequential_cpu_offload()` — much lower peak memory (both VRAM and system RAM), but noticeably slower; use this if `1` still gets OOM-killed on a memory-capped pod. |
    | `DEFAULT_STEPS` | `40` | Default inference steps. |
    | `MAX_INPUT_DIM` | `2048` | Input images are downscaled to this max side. |
 
@@ -172,6 +172,7 @@ RunPod bills by the second while a pod is running.
 | `ImportError: Qwen3VLVideoProcessor requires the Torchvision library` | `torchvision` was missing from `requirements.txt` — now pinned. `git pull` this fix and restart; the hash check will reinstall automatically. |
 | `UserWarning: CUDA initialization: The NVIDIA driver on your system is too old (found version ...)` | pip grabbed a torch build for a newer CUDA than the pod's driver supports. `torch`/`torchvision` are now pinned to exact CUDA 12.4 builds via `--extra-index-url https://download.pytorch.org/whl/cu124`, matching the pod image's CUDA 12.4.1 toolkit. `git pull` and restart. |
 | `CUDA out of memory` / HTTP 507 | Redeploy on a bigger GPU, or set `CPU_OFFLOAD=1` and restart. |
+| Process gets `Killed` right after the denoising steps finish (no Python traceback) | The container's memory cgroup limit was hit (check with `cat /sys/fs/cgroup/memory.max` — this can be much lower than what `free -h` reports, which shows the *host's* RAM). `CPU_OFFLOAD=1`'s submodule handoff (transformer back to CPU, VAE onto GPU) can itself spike peak memory. Set `CPU_OFFLOAD=sequential` instead — much lower peak memory, slower generation — and restart. |
 | `GatedRepoError` / `401` / `403` in the logs while downloading | Add `HF_TOKEN` (see *Gated model?* above). |
 | `fatal: could not read Username` in the logs | The repo is private. Make it public or use the token URL (section 2). |
 | `$'\r': command not found` | `bootstrap.sh` has Windows line endings. `.gitattributes` prevents this; if it still happens, re-commit after `git add --renormalize .`. |

@@ -23,7 +23,16 @@ from PIL import Image
 
 MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-2.1")
 API_KEY = os.getenv("API_KEY", "")                      # empty = no auth
-CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"       # enable on smaller GPUs
+# CPU_OFFLOAD: "0" = none (needs the most VRAM, fastest).
+# "1"/"model" = enable_model_cpu_offload() — moves whole submodules between
+#   CPU/GPU; lower VRAM, but the handoff at the end (transformer back to CPU,
+#   VAE onto GPU) can itself spike peak memory on a tightly memory-capped pod.
+# "sequential" = enable_sequential_cpu_offload() — moves individual layers
+#   on/off the GPU one at a time; much lower peak memory, but noticeably
+#   slower. Use this when "1" still gets OOM-killed on a memory-capped pod.
+CPU_OFFLOAD_MODE = os.getenv("CPU_OFFLOAD", "0").strip().lower()
+if CPU_OFFLOAD_MODE == "1":
+    CPU_OFFLOAD_MODE = "model"
 DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "40"))
 # Lower than the model's max (2048) by default: VAE decode memory scales with
 # pixel count, and on a memory-capped pod (e.g. a ~29GB container cgroup limit)
@@ -39,10 +48,12 @@ pipe_lock = threading.Lock()  # one generation at a time on a single GPU
 
 
 def load_pipeline() -> QwenImage21Pipeline:
-    log.info("loading %s (cpu_offload=%s)...", MODEL_ID, CPU_OFFLOAD)
+    log.info("loading %s (cpu_offload=%s)...", MODEL_ID, CPU_OFFLOAD_MODE)
     t0 = time.time()
     p = QwenImage21Pipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
-    if CPU_OFFLOAD:
+    if CPU_OFFLOAD_MODE == "sequential":
+        p.enable_sequential_cpu_offload()
+    elif CPU_OFFLOAD_MODE == "model":
         p.enable_model_cpu_offload()
     else:
         p.to("cuda")
@@ -143,7 +154,7 @@ def generate(
             result = pipe(**kwargs).images[0]
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
-            raise HTTPException(status_code=507, detail="GPU out of memory — try smaller size or CPU_OFFLOAD=1")
+            raise HTTPException(status_code=507, detail="GPU out of memory — try smaller size, CPU_OFFLOAD=1, or CPU_OFFLOAD=sequential")
     elapsed = time.time() - t0
     log.info("done in %.1fs", elapsed)
 
