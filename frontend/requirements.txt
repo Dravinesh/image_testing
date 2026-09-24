@@ -1,3 +1,9 @@
 streamlit>=1.40
 httpx
 python-dotenv>=1.0.0
+
+# Phase 2: local YOLO + Gemini pre-processing (pipeline/orchestrator.py),
+# run on this same machine before calling the Qwen server on RunPod.
+ultralytics
+opencv-python-headless
+numpy

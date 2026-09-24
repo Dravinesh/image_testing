@@ -2,3 +2,9 @@
 __pycache__/
 *.pyc
 package-lock.json
+
+# Phase 2: YOLO weights (large binary, kept locally per-machine rather than
+# in git) and generated results (output, not source).
+*.pt
+results/*
+!results/.gitkeep
