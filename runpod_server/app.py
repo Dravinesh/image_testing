@@ -25,7 +25,11 @@ MODEL_ID = os.getenv("MODEL_ID", "Qwen/Qwen-Image-2.1")
 API_KEY = os.getenv("API_KEY", "")                      # empty = no auth
 CPU_OFFLOAD = os.getenv("CPU_OFFLOAD", "0") == "1"       # enable on smaller GPUs
 DEFAULT_STEPS = int(os.getenv("DEFAULT_STEPS", "40"))
-MAX_INPUT_DIM = int(os.getenv("MAX_INPUT_DIM", "2048"))
+# Lower than the model's max (2048) by default: VAE decode memory scales with
+# pixel count, and on a memory-capped pod (e.g. a ~29GB container cgroup limit)
+# a full 2048px decode right after the denoising loop finishes is what tends to
+# get the process OOM-killed. Raise via env var on a pod with more headroom.
+MAX_INPUT_DIM = int(os.getenv("MAX_INPUT_DIM", "1024"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("qwen-image-server")
@@ -46,11 +50,19 @@ def load_pipeline() -> QwenImage21Pipeline:
     # Decode the final image in tiles/slices instead of all at once — cuts peak
     # memory during the VAE decode step, which is where an OOM tends to hit
     # right after the denoising loop finishes (steps complete, then "Killed").
-    for method in ("enable_vae_slicing", "enable_vae_tiling"):
+    # Try both the pipeline-level convenience wrappers and the VAE submodule
+    # directly — QwenImage21Pipeline doesn't define the former, but its VAE
+    # class may still implement the latter.
+    targets = [(p, "enable_vae_slicing"), (p, "enable_vae_tiling")]
+    vae = getattr(p, "vae", None)
+    if vae is not None:
+        targets += [(vae, "enable_slicing"), (vae, "enable_tiling")]
+    for obj, method in targets:
         try:
-            getattr(p, method)()
+            getattr(obj, method)()
+            log.info("%s.%s() enabled", type(obj).__name__, method)
         except Exception as exc:
-            log.warning("%s not available/failed: %s", method, exc)
+            log.warning("%s.%s not available/failed: %s", type(obj).__name__, method, exc)
 
     log.info("model loaded in %.1fs", time.time() - t0)
     return p
