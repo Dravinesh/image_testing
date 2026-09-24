@@ -42,6 +42,16 @@ def load_pipeline() -> QwenImage21Pipeline:
         p.enable_model_cpu_offload()
     else:
         p.to("cuda")
+
+    # Decode the final image in tiles/slices instead of all at once — cuts peak
+    # memory during the VAE decode step, which is where an OOM tends to hit
+    # right after the denoising loop finishes (steps complete, then "Killed").
+    for method in ("enable_vae_slicing", "enable_vae_tiling"):
+        try:
+            getattr(p, method)()
+        except Exception as exc:
+            log.warning("%s not available/failed: %s", method, exc)
+
     log.info("model loaded in %.1fs", time.time() - t0)
     return p
 
