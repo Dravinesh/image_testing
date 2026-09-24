@@ -19,6 +19,10 @@ Qwen-Image-2.1 server on RunPod:
 
 If nothing is detected in steps 1-2, the Qwen call is skipped entirely and
 the original image is returned unchanged.
+
+Steps 1-3 (YOLO + Gemini + merge) always run and their output is saved to
+MASK_PREVIEW_DIR before step 4 is attempted — so you can verify YOLO/Gemini
+are working even if the Qwen pod isn't connected yet.
 """
 import base64
 import io
@@ -32,8 +36,20 @@ import numpy as np
 from PIL import Image, ImageFilter
 from ultralytics import YOLO
 
-YOLO_MODEL_PATH = Path(__file__).resolve().parent.parent / "yolov8n-seg.pt"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+YOLO_MODEL_PATH = PROJECT_ROOT / "yolov8n-seg.pt"
 YOLO_REMOVE_CLASSES = [0]  # COCO class 0 = person
+
+# Where step 1-3 output (masks + an overlay preview) is saved, so YOLO/Gemini
+# can be checked independently of whether the Qwen pod is reachable.
+MASK_PREVIEW_DIR = PROJECT_ROOT / "mask_previews"
+
+
+class QwenNotConnectedError(RuntimeError):
+    """Raised when the Qwen/RunPod server isn't configured or reachable —
+    distinct from other errors (bad response, OOM, etc.) so the frontend can
+    show a clear, specific message instead of a raw connection traceback."""
+    pass
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_DETECT_MODEL = "gemini-2.5-flash"
@@ -176,6 +192,41 @@ def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndar
     return mask, labels
 
 
+def save_mask_previews(
+    name: str,
+    image: Image.Image,
+    person_mask: np.ndarray,
+    clutter_mask: np.ndarray,
+    merged_mask: np.ndarray,
+    labels: list[str],
+) -> Path:
+    """Saves YOLO/Gemini's raw output — independent of whether the Qwen call
+    that follows succeeds — so those two steps can be checked on their own.
+    Returns the directory the files were written into."""
+    MASK_PREVIEW_DIR.mkdir(exist_ok=True)
+    stem = Path(name).stem
+
+    Image.fromarray(person_mask).save(MASK_PREVIEW_DIR / f"{stem}_1_yolo_person_mask.png")
+    Image.fromarray(clutter_mask).save(MASK_PREVIEW_DIR / f"{stem}_2_gemini_clutter_mask.png")
+    Image.fromarray(merged_mask).save(MASK_PREVIEW_DIR / f"{stem}_3_merged_mask.png")
+
+    # Original image with the merged mask drawn as a translucent red overlay
+    # — the fastest way to eyeball whether the right regions got flagged.
+    overlay = image.convert("RGBA")
+    red_layer = Image.new("RGBA", image.size, (255, 0, 0, 0))
+    alpha = Image.fromarray(merged_mask).convert("L").point(lambda p: 120 if p > 0 else 0)
+    red_layer.putalpha(alpha)
+    Image.alpha_composite(overlay, red_layer).convert("RGB").save(
+        MASK_PREVIEW_DIR / f"{stem}_4_overlay.png"
+    )
+
+    (MASK_PREVIEW_DIR / f"{stem}_labels.txt").write_text(
+        "\n".join(labels) if labels else "(none detected)", encoding="utf-8"
+    )
+
+    return MASK_PREVIEW_DIR
+
+
 def build_removal_prompt(gemini_labels: list[str], person_detected: bool) -> str:
     """Step 4 prep: since Qwen has no mask input, tell it in plain language
     what to remove instead. The mask (from steps 1-3) is what actually
@@ -209,18 +260,25 @@ def call_qwen(
     timeout: float = 600.0,
 ) -> Image.Image:
     """Step 4: send the full image + removal prompt to the Qwen server."""
+    if not base_url or not base_url.strip() or "<pod-id>" in base_url:
+        raise QwenNotConnectedError("Qwen on RunPod is not connected")
+
     buf = io.BytesIO()
     image.save(buf, format="JPEG", quality=95)
     buf.seek(0)
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-    resp = httpx.post(
-        f"{base_url.rstrip('/')}/generate",
-        data={"prompt": prompt, "num_inference_steps": str(num_inference_steps)},
-        files={"image": ("input.jpg", buf.getvalue(), "image/jpeg")},
-        headers=headers,
-        timeout=timeout,
-    )
+    try:
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/generate",
+            data={"prompt": prompt, "num_inference_steps": str(num_inference_steps)},
+            files={"image": ("input.jpg", buf.getvalue(), "image/jpeg")},
+            headers=headers,
+            timeout=timeout,
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        raise QwenNotConnectedError("Qwen on RunPod is not connected") from exc
+
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
@@ -242,9 +300,11 @@ def process_image(
     runpod_base_url: str,
     runpod_api_key: str,
     num_inference_steps: int = 40,
+    name: str = "image",
 ) -> tuple[Image.Image, dict]:
     """Runs the full pipeline on one already-opened PIL image.
-    Returns (result_image, debug_info)."""
+    Returns (result_image, debug_info). `name` is only used to name the
+    saved preview files (see MASK_PREVIEW_DIR)."""
     if image.mode != "RGB":
         image = image.convert("RGB")
     image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -256,7 +316,11 @@ def process_image(
 
     merged_mask = cv2.bitwise_or(person_mask, clutter_mask)
 
-    debug_info = {"person_found": person_found, "labels": labels}
+    # Save YOLO/Gemini output BEFORE the Qwen call, so it's there to inspect
+    # even if that call fails (e.g. the pod isn't connected yet).
+    preview_dir = save_mask_previews(name, image, person_mask, clutter_mask, merged_mask, labels)
+
+    debug_info = {"person_found": person_found, "labels": labels, "preview_dir": str(preview_dir)}
 
     if not merged_mask.any():
         # Nothing flagged — skip the Qwen call and return the original as-is.
@@ -265,7 +329,14 @@ def process_image(
 
     debug_info["skipped"] = False
     prompt = build_removal_prompt(labels, person_found)
-    edited = call_qwen(runpod_base_url, runpod_api_key, image, prompt, num_inference_steps)
+    try:
+        edited = call_qwen(runpod_base_url, runpod_api_key, image, prompt, num_inference_steps)
+    except Exception as exc:
+        # YOLO/Gemini already ran and their output is saved — attach that
+        # info to the exception so callers (e.g. the frontend) can still show
+        # it even though the pipeline didn't finish.
+        exc.debug_info = debug_info  # type: ignore[attr-defined]
+        raise
     result = composite(image, edited, merged_mask)
 
     return result, debug_info

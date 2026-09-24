@@ -107,21 +107,29 @@ with tab_batch:
                 st.image(item["result_bytes"] or item["bytes"], caption=f"{icon} {item['name']}", use_container_width=True)
                 if item["status"] == "error":
                     st.caption(f"error: {item['error']}")
-                elif item["info"]:
+                if item["info"]:
                     labels = item["info"].get("labels") or []
                     bits = []
                     if item["info"].get("person_found"):
                         bits.append("person")
                     bits.extend(labels)
                     if bits:
-                        st.caption("removed: " + ", ".join(bits))
+                        st.caption(("detected: " if item["status"] == "error" else "removed: ") + ", ".join(bits))
                     elif item["status"] == "skipped":
                         st.caption("nothing flagged — left unchanged")
+                    if item["status"] == "error" and item["info"].get("preview_dir"):
+                        st.caption(f"YOLO/Gemini output saved — check `{item['info']['preview_dir']}`")
 
         for ph, item in zip(placeholders, queue):
             render_item(ph, item)
 
-        disabled = not (api_url and gemini_key) or all(i["status"] != "pending" for i in queue)
+        # Only Gemini is required to start — the Qwen URL is optional here on
+        # purpose, so YOLO + Gemini can be verified (via mask_previews/) even
+        # before the RunPod pod is connected; process_image() will raise a
+        # clear "Qwen on RunPod is not connected" error at that point instead.
+        disabled = not gemini_key or all(i["status"] != "pending" for i in queue)
+        if not api_url:
+            st.caption("⚠️ No Qwen API URL set — YOLO + Gemini will still run and save previews to `mask_previews/`, but each image will end in a 'Qwen on RunPod is not connected' error.")
         if st.button("Process Queue", type="primary", disabled=disabled):
             for ph, item in zip(placeholders, queue):
                 if item["status"] != "pending":
@@ -131,7 +139,8 @@ with tab_batch:
                 try:
                     img = Image.open(io.BytesIO(item["bytes"]))
                     result, info = process_image(
-                        img, gemini_key, api_url, api_key, num_inference_steps=steps
+                        img, gemini_key, api_url, api_key,
+                        num_inference_steps=steps, name=item["name"],
                     )
                     buf = io.BytesIO()
                     result.save(buf, format="PNG")
@@ -144,12 +153,11 @@ with tab_batch:
                 except Exception as exc:
                     item["status"] = "error"
                     item["error"] = str(exc)
+                    item["info"] = getattr(exc, "debug_info", None)
                 render_item(ph, item)
             st.success(f"Queue finished. Results saved in `{RESULTS_DIR}`.")
 
-        if not api_url:
-            st.info("Enter the Qwen API URL in the sidebar to enable processing.")
-        elif not gemini_key:
+        if not gemini_key:
             st.info("Enter a Gemini API key in the sidebar to enable processing.")
     else:
         st.info("Upload one or more images to build the queue.")

@@ -8,3 +8,5 @@ package-lock.json
 *.pt
 results/*
 !results/.gitkeep
+mask_previews/*
+!mask_previews/.gitkeep
