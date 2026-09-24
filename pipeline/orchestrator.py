@@ -8,21 +8,25 @@ Qwen-Image-2.1 server on RunPod:
   2. Gemini detects other removable clutter/trash/temporary objects and
      masks them (bounding boxes -> filled rectangles).
   3. The two masks are merged (union) and dilated slightly.
-  4. Qwen-Image-2.1 (on RunPod) is asked, via a text prompt describing what
-     to remove, to edit the WHOLE image — it has no mask/inpaint input of
-     its own (confirmed against the actual diffusers pipeline source: only
-     `prompt` + `image`, no `mask_image` parameter).
-  5. Qwen's output is composited back onto the ORIGINAL image using the
-     merged mask (with feathered edges), so only the masked regions
-     actually change and everything else stays pixel-identical — this is
-     what makes step 4's whole-image edit behave like masked inpainting.
+  4. The merged mask is burned into the image as a translucent red overlay
+     (a form of "painted annotation" — the model card mentions this as a way
+     to point Qwen at a region, since it has no literal mask_image
+     parameter: confirmed against the actual diffusers pipeline source, only
+     `prompt` + `image`). That OVERLAY image — not the plain original — is
+     sent to Qwen-Image-2.1 (on RunPod) with a fixed inpainting prompt.
+  5. Qwen's output is composited back onto the ORIGINAL (non-overlaid)
+     image using the merged mask (with feathered edges), so only the masked
+     regions actually change and everything else stays pixel-identical —
+     Qwen alone can't mechanically guarantee that, so this is what actually
+     enforces it.
 
 If nothing is detected in steps 1-2, the Qwen call is skipped entirely and
 the original image is returned unchanged.
 
 Steps 1-3 (YOLO + Gemini + merge) always run and their output is saved to
-MASK_PREVIEW_DIR before step 4 is attempted — so you can verify YOLO/Gemini
-are working even if the Qwen pod isn't connected yet.
+MASK_PREVIEW_DIR (in yolo_masked/, gemini_masked/, overlay/ subfolders)
+before step 4 is attempted — so you can verify YOLO/Gemini are working even
+if the Qwen pod isn't connected yet.
 """
 import base64
 import io
@@ -41,9 +45,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 YOLO_MODEL_PATH = PROJECT_ROOT / "yolov8n-seg.pt"
 YOLO_REMOVE_CLASSES = [0]  # COCO class 0 = person
 
-# Where step 1-3 output (masks + an overlay preview) is saved, so YOLO/Gemini
-# can be checked independently of whether the Qwen pod is reachable.
+# Where step 1-3 output is saved, so YOLO/Gemini can be checked
+# independently of whether the Qwen pod is reachable. overlay/ additionally
+# holds the actual image sent to Qwen (see save_mask_previews / call_qwen).
 MASK_PREVIEW_DIR = PROJECT_ROOT / "mask_previews"
+YOLO_MASK_DIR = MASK_PREVIEW_DIR / "yolo_masked"
+GEMINI_MASK_DIR = MASK_PREVIEW_DIR / "gemini_masked"
+OVERLAY_DIR = MASK_PREVIEW_DIR / "overlay"
 
 
 class QwenNotConnectedError(RuntimeError):
@@ -99,6 +107,43 @@ Do NOT flag items that are a permanent or semi-permanent part of the property:
 
 Return an empty array [] if nothing needs to be removed.
 Return ONLY the JSON array, no explanation or other text.
+"""
+
+# Fixed prompt sent to Qwen alongside the overlay image (step 4). Unlike the
+# old per-image build_removal_prompt(), this doesn't name specific items —
+# it relies entirely on the red overlay burned into the image to show Qwen
+# which regions are masked.
+INPAINT_PROMPT = """
+PROPERTY LISTING PHOTO CLEANUP
+
+TASK:
+Inpaint only the regions marked by the mask. The mask covers people, clutter, trash, dirt, stains, debris, and construction waste.
+Every pixel outside the mask must remain PIXEL-PERFECT unchanged.
+This photo may be an indoor room, an outdoor building exterior, or an open plot of land — apply the rules accordingly.
+
+FILL RULES (masked regions only):
+- Fill each masked region seamlessly using the most plausible background
+- Match the exact texture, color, pattern, lighting, and shadow of immediately adjacent visible areas
+- Indoor floor regions: restore original flooring material, pattern, and color exactly
+- Outdoor ground regions: restore original surface (soil, concrete, paving, grass) exactly
+- Wall or facade regions: restore with matching material, color, texture, and lighting gradient
+- The fill must look like the removed object was never there — no visible seam, edge, or artifact
+
+STRICT PRESERVATION (non-masked areas — do not touch):
+- Do not alter any pixel outside the masked region
+- Do not change any permanent structure: walls, ceilings, floors, building facade, boundary walls, compound walls, gates, fences, pillars, staircases
+- Do not change any opening or fitting: doors, windows, grills, railings, balconies, arches
+- Do not change any fixture or appliance: AC units, fans, lights, switches, electrical panels, water tanks, signage belonging to the property
+- Do not change permanent built-ins: cabinets, shelves, counters, machinery, industrial equipment
+- Do not change vegetation: trees, shrubs, hedges, plants, grass
+- Do not change room dimensions, building proportions, plot boundaries, perspective, camera angle, or composition
+
+PHOTO ENHANCEMENT (apply globally across the whole image):
+- Improve brightness and exposure balance
+- Enhance sharpness and clarity
+- Correct color accuracy
+
+Output: the SAME property photo with only the masked distractions removed and overall image quality improved.
 """
 
 _yolo_model: Optional[YOLO] = None
@@ -219,66 +264,32 @@ def save_mask_previews(
     clutter_mask: np.ndarray,
     merged_mask: np.ndarray,
     labels: list[str],
-) -> Path:
-    """Saves YOLO/Gemini's raw output — independent of whether the Qwen call
-    that follows succeeds — so those two steps can be checked on their own.
-    Returns the directory the files were written into."""
-    MASK_PREVIEW_DIR.mkdir(exist_ok=True)
+) -> tuple[Path, Image.Image]:
+    """Saves YOLO/Gemini's raw output into subfolders — independent of
+    whether the Qwen call that follows succeeds — so those two steps can be
+    checked on their own. Also builds and returns the overlay image, which
+    is what actually gets sent to Qwen (see call_qwen / process_image)."""
+    YOLO_MASK_DIR.mkdir(parents=True, exist_ok=True)
+    GEMINI_MASK_DIR.mkdir(parents=True, exist_ok=True)
+    OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
     stem = Path(name).stem
 
-    Image.fromarray(person_mask).save(MASK_PREVIEW_DIR / f"{stem}_1_yolo_person_mask.png")
-    Image.fromarray(clutter_mask).save(MASK_PREVIEW_DIR / f"{stem}_2_gemini_clutter_mask.png")
-    Image.fromarray(merged_mask).save(MASK_PREVIEW_DIR / f"{stem}_3_merged_mask.png")
+    Image.fromarray(person_mask).save(YOLO_MASK_DIR / f"{stem}.png")
+    Image.fromarray(clutter_mask).save(GEMINI_MASK_DIR / f"{stem}.png")
+    (GEMINI_MASK_DIR / f"{stem}_labels.txt").write_text(
+        "\n".join(labels) if labels else "(none detected)", encoding="utf-8"
+    )
 
-    # Original image with the merged mask drawn as a translucent red overlay
-    # — the fastest way to eyeball whether the right regions got flagged.
+    # Original image with the merged mask drawn as a translucent red overlay.
     overlay = image.convert("RGBA")
     red_layer = Image.new("RGBA", image.size, (255, 0, 0, 0))
     alpha = Image.fromarray(merged_mask).convert("L").point(lambda p: 120 if p > 0 else 0)
     red_layer.putalpha(alpha)
-    Image.alpha_composite(overlay, red_layer).convert("RGB").save(
-        MASK_PREVIEW_DIR / f"{stem}_4_overlay.png"
-    )
+    overlay_image = Image.alpha_composite(overlay, red_layer).convert("RGB")
+    overlay_image.save(OVERLAY_DIR / f"{stem}.png")
+    Image.fromarray(merged_mask).save(OVERLAY_DIR / f"{stem}_mask.png")
 
-    (MASK_PREVIEW_DIR / f"{stem}_labels.txt").write_text(
-        "\n".join(labels) if labels else "(none detected)", encoding="utf-8"
-    )
-
-    return MASK_PREVIEW_DIR
-
-
-# Gemini can independently label a person too (e.g. "person", "man on
-# ladder") — when YOLO already flagged people, drop those from Gemini's list
-# so the prompt doesn't repeat itself (was producing "any people, person").
-_PERSON_SYNONYMS = {"person", "people", "human", "man", "woman", "occupant", "worker", "visitor"}
-
-
-def build_removal_prompt(gemini_labels: list[str], person_detected: bool) -> str:
-    """Step 4 prep: since Qwen has no mask input, tell it in plain language
-    what's already been marked for removal. Qwen's only job here is to fill
-    those areas in naturally — it doesn't decide what to remove, the mask
-    (from steps 1-3) already did, and composite() enforces that boundary
-    afterward regardless of what Qwen does elsewhere in the image."""
-    other_items = sorted({
-        label for label in gemini_labels
-        if not (person_detected and label.strip().lower() in _PERSON_SYNONYMS)
-    })
-    items = (["people"] if person_detected else []) + other_items
-    items_text = ", ".join(items) if items else "clutter, trash, and temporary objects"
-
-    return (
-        "PROPERTY LISTING PHOTO CLEANUP.\n"
-        f"The following have already been marked for removal: {items_text}.\n"
-        "Your only task is to fill in those marked areas naturally — match "
-        "the exact texture, color, pattern, lighting, and shadow of the "
-        "immediately surrounding area, so it looks like they were never "
-        "there. Do not add, remove, or restyle anything else.\n"
-        "Keep everything else in the photo exactly unchanged: the building "
-        "structure, walls, floors, furniture, fixtures, windows, doors, "
-        "vegetation, and the overall composition, perspective, and lighting "
-        "must remain identical.\n"
-        "Also improve overall brightness, sharpness, and color accuracy."
-    )
+    return MASK_PREVIEW_DIR, overlay_image
 
 
 def call_qwen(
@@ -289,7 +300,8 @@ def call_qwen(
     num_inference_steps: int = 40,
     timeout: float = 600.0,
 ) -> Image.Image:
-    """Step 4: send the full image + removal prompt to the Qwen server."""
+    """Step 4: send `image` (the overlay image — see process_image) + the
+    inpainting prompt to the Qwen server."""
     if not base_url or not base_url.strip() or "<pod-id>" in base_url:
         raise QwenNotConnectedError("Qwen on RunPod is not connected")
 
@@ -346,9 +358,12 @@ def process_image(
 
     merged_mask = cv2.bitwise_or(person_mask, clutter_mask)
 
-    # Save YOLO/Gemini output BEFORE the Qwen call, so it's there to inspect
-    # even if that call fails (e.g. the pod isn't connected yet).
-    preview_dir = save_mask_previews(name, image, person_mask, clutter_mask, merged_mask, labels)
+    # Save YOLO/Gemini output (and build the overlay image) BEFORE the Qwen
+    # call, so it's there to inspect even if that call fails (e.g. the pod
+    # isn't connected yet).
+    preview_dir, overlay_image = save_mask_previews(
+        name, image, person_mask, clutter_mask, merged_mask, labels
+    )
 
     debug_info = {"person_found": person_found, "labels": labels, "preview_dir": str(preview_dir)}
 
@@ -358,9 +373,9 @@ def process_image(
         return image, debug_info
 
     debug_info["skipped"] = False
-    prompt = build_removal_prompt(labels, person_found)
     try:
-        edited = call_qwen(runpod_base_url, runpod_api_key, image, prompt, num_inference_steps)
+        # Only the overlay image goes to Qwen — not the plain original.
+        edited = call_qwen(runpod_base_url, runpod_api_key, overlay_image, INPAINT_PROMPT, num_inference_steps)
     except Exception as exc:
         # YOLO/Gemini already ran and their output is saved — attach that
         # info to the exception so callers (e.g. the frontend) can still show
