@@ -52,7 +52,12 @@ class QwenNotConnectedError(RuntimeError):
     pass
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
-GEMINI_DETECT_MODEL = "gemini-2.5-flash"
+# gemini-2.5-flash is now legacy (restricted to accounts that used it before)
+# and 404s for new/unrelated keys — gemini-3.5-flash is its current
+# same-tier successor (fast/cheap, matching the original choice of "flash"
+# over "pro"). gemini-3.8-flash is available if higher detection accuracy
+# is worth the extra cost.
+GEMINI_DETECT_MODEL = "gemini-3.5-flash"
 GEMINI_MAX_DIM = 1024
 
 # Feather (Gaussian blur) radius applied to the mask before compositing, in
