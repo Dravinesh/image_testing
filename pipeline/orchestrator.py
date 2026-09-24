@@ -27,6 +27,7 @@ are working even if the Qwen pod isn't connected yet.
 import base64
 import io
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -151,6 +152,13 @@ def _parse_gemini_json(text: str) -> list:
     return json.loads(text)
 
 
+# Status codes worth retrying: 503/500/502/504 are Google's own "temporarily
+# unavailable/overloaded" family, and 429 is rate-limiting — both are
+# typically transient, unlike e.g. a 400 (bad request) or 403 (bad key).
+GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
+GEMINI_MAX_ATTEMPTS = 4
+
+
 def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndarray, list[str]]:
     """Step 2: Gemini bounding-box detection of non-property items.
     Returns (mask, detected_labels)."""
@@ -158,20 +166,27 @@ def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndar
     mask = np.zeros((h, w), dtype=np.uint8)
 
     b64 = _to_gemini_b64(image_bgr)
-    resp = httpx.post(
-        f"{GEMINI_BASE_URL}/{GEMINI_DETECT_MODEL}:generateContent",
-        params={"key": gemini_key},
-        json={
-            "contents": [{
-                "parts": [
-                    {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
-                    {"text": GEMINI_DETECT_PROMPT},
-                ]
-            }],
-            "generationConfig": {"responseMimeType": "application/json"},
-        },
-        timeout=120.0,
-    )
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                {"text": GEMINI_DETECT_PROMPT},
+            ]
+        }],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }
+
+    resp = None
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        resp = httpx.post(
+            f"{GEMINI_BASE_URL}/{GEMINI_DETECT_MODEL}:generateContent",
+            params={"key": gemini_key},
+            json=payload,
+            timeout=120.0,
+        )
+        if resp.status_code not in GEMINI_RETRY_STATUS or attempt == GEMINI_MAX_ATTEMPTS:
+            break
+        time.sleep(2 ** attempt)  # 2s, 4s, 8s between attempts 1-2, 2-3, 3-4
     resp.raise_for_status()
 
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
