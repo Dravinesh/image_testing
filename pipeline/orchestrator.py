@@ -262,7 +262,7 @@ Look at this photo and identify anything that should be removed to make it look 
 
 Do NOT flag anything that is a permanent or semi-permanent part of the property: building structure, doors, windows, fixtures, furniture, appliances, built-ins, boundary walls/gates/fences, or vegetation.
 
-Write a short image-editing instruction (2-3 sentences, plain prose, no bullet points or JSON) addressed directly to an AI photo-editing model, telling it exactly what to remove from this photo and how to fill in those areas so the result looks natural, seamless, and professional. Also tell it to keep everything else in the photo unchanged, and to improve overall brightness, sharpness, and color accuracy.
+Write a short image-editing instruction (2-3 sentences, plain prose, no bullet points or JSON) addressed directly to an AI photo-editing model, telling it exactly what to remove from this photo and how to fill in those areas so the result looks natural and seamless. Explicitly tell it to leave every other pixel in the photo completely unchanged — do not ask for any brightness, exposure, sharpness, color, or other global enhancement; only the removal and fill matter.
 
 If nothing in the photo needs to be removed, respond with exactly the single word: NONE
 """
