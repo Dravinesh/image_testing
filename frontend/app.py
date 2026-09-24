@@ -3,12 +3,12 @@ Streamlit frontend.
 
 Two tabs:
   - "Batch Cleanup" (Phase 2): upload multiple images, each is queued and run
-    through the full local pipeline (YOLO person masking + Gemini clutter
-    detection -> merged mask -> Qwen-Image-2.1 on RunPod -> composited back
-    using the mask). Results are saved into results/ and shown with a tick
+    through the full local pipeline (Gemini looks at the photo and writes a
+    short removal prompt -> Qwen-Image-2.1 on RunPod edits the image using
+    that prompt). Results are saved into results/ and shown with a tick
     once each image finishes.
   - "Single Test" (Phase 1): raw one-off calls straight to the Qwen server,
-    no YOLO/Gemini/masking — useful for testing the RunPod server itself.
+    no Gemini involved — useful for testing the RunPod server itself.
 
 Run (from the project root):
     streamlit run frontend/app.py
@@ -61,10 +61,10 @@ with st.sidebar:
 tab_batch, tab_single = st.tabs(["Batch Cleanup", "Single Test"])
 
 # ─────────────────────────────────────────────────────────────────────────
-# Batch Cleanup (Phase 2): YOLO + Gemini + Qwen, queued, multiple images
+# Batch Cleanup (Phase 2): Gemini writes the prompt, Qwen edits, queued
 # ─────────────────────────────────────────────────────────────────────────
 with tab_batch:
-    st.caption("Upload one or more photos. Each is queued, then run through YOLO (people) + Gemini (clutter) + Qwen (removal), and saved into `results/`.")
+    st.caption("Upload one or more photos. Each is queued, then run through Gemini (writes a removal prompt) + Qwen (edits accordingly), and saved into `results/`.")
 
     uploaded_files = st.file_uploader(
         "Input images",
@@ -108,28 +108,26 @@ with tab_batch:
                 if item["status"] == "error":
                     st.caption(f"error: {item['error']}")
                 if item["info"]:
-                    labels = item["info"].get("labels") or []
-                    bits = []
-                    if item["info"].get("person_found"):
-                        bits.append("person")
-                    bits.extend(labels)
-                    if bits:
-                        st.caption(("detected: " if item["status"] == "error" else "removed: ") + ", ".join(bits))
+                    prompt = item["info"].get("removal_prompt")
+                    if prompt:
+                        label = "Gemini's prompt: " if item["status"] == "error" else "removed per: "
+                        st.caption(label + prompt)
                     elif item["status"] == "skipped":
-                        st.caption("nothing flagged — left unchanged")
+                        st.caption("Gemini flagged nothing — left unchanged")
                     if item["status"] == "error" and item["info"].get("preview_dir"):
-                        st.caption(f"YOLO/Gemini output saved — check `{item['info']['preview_dir']}`")
+                        st.caption(f"Gemini's prompt saved — check `{item['info']['preview_dir']}/gemini_prompt/`")
 
         for ph, item in zip(placeholders, queue):
             render_item(ph, item)
 
         # Only Gemini is required to start — the Qwen URL is optional here on
-        # purpose, so YOLO + Gemini can be verified (via mask_previews/) even
-        # before the RunPod pod is connected; process_image() will raise a
-        # clear "Qwen on RunPod is not connected" error at that point instead.
+        # purpose, so Gemini's prompt-writing can be verified (via
+        # mask_previews/gemini_prompt/) even before the RunPod pod is
+        # connected; process_image() will raise a clear "Qwen on RunPod is
+        # not connected" error at that point instead.
         disabled = not gemini_key or all(i["status"] != "pending" for i in queue)
         if not api_url:
-            st.caption("⚠️ No Qwen API URL set — YOLO + Gemini will still run and save previews to `mask_previews/`, but each image will end in a 'Qwen on RunPod is not connected' error.")
+            st.caption("⚠️ No Qwen API URL set — Gemini will still run and save its generated prompt to `mask_previews/gemini_prompt/`, but each image will end in a 'Qwen on RunPod is not connected' error.")
         if st.button("Process Queue", type="primary", disabled=disabled):
             for ph, item in zip(placeholders, queue):
                 if item["status"] != "pending":

@@ -2,31 +2,32 @@
 Phase 2 local orchestration pipeline.
 
 Runs entirely on the local machine, except the single call to the
-Qwen-Image-2.1 server on RunPod:
+Qwen-Image-2.1 server on RunPod.
 
-  1. YOLO (yolov8n-seg.pt, local file) detects and masks people.
-  2. Gemini detects other removable clutter/trash/temporary objects and
-     masks them (bounding boxes -> filled rectangles).
-  3. The two masks are merged (union) and dilated slightly.
-  4. The merged mask is burned into the image as a translucent red overlay
-     (a form of "painted annotation" — the model card mentions this as a way
-     to point Qwen at a region, since it has no literal mask_image
-     parameter: confirmed against the actual diffusers pipeline source, only
-     `prompt` + `image`). That OVERLAY image — not the plain original — is
-     sent to Qwen-Image-2.1 (on RunPod) with a fixed inpainting prompt.
-  5. Qwen's output is composited back onto the ORIGINAL (non-overlaid)
-     image using the merged mask (with feathered edges), so only the masked
-     regions actually change and everything else stays pixel-identical —
-     Qwen alone can't mechanically guarantee that, so this is what actually
-     enforces it.
+CURRENT pipeline (process_image, "v2" — no YOLO, no pixel mask):
+  1. The image is sent straight to Gemini, which both decides what should be
+     removed AND writes a short (2-3 sentence) natural-language editing
+     instruction describing it.
+  2. That instruction is used directly as Qwen's prompt, sent along with the
+     (unmodified) original image.
+  3. Qwen's output IS the final result — there's no mask, so there's nothing
+     to composite against; the whole-image edit is trusted directly.
+  Gemini's generated prompt is saved to mask_previews/gemini_prompt/ before
+  the Qwen call is attempted, so it can be checked even if the pod isn't
+  connected yet.
 
-If nothing is detected in steps 1-2, the Qwen call is skipped entirely and
-the original image is returned unchanged.
-
-Steps 1-3 (YOLO + Gemini + merge) always run and their output is saved to
-MASK_PREVIEW_DIR (in yolo_masked/, gemini_masked/, overlay/ subfolders)
-before step 4 is attempted — so you can verify YOLO/Gemini are working even
-if the Qwen pod isn't connected yet.
+LEGACY pipeline (process_image_masked — kept, not deleted, just unused by
+default): YOLO masks people, Gemini separately returns bounding boxes for
+other clutter, the two masks are merged, burned into the image as a red
+overlay ("painted annotation" — the model card mentions this as a way to
+point Qwen at a region, since it has no literal mask_image parameter:
+confirmed against the actual diffusers pipeline source, only `prompt` +
+`image`), sent to Qwen with a fixed inpainting prompt, and Qwen's output is
+composited back onto the ORIGINAL image using the merged mask — since Qwen
+alone can't mechanically guarantee "unmasked pixels stay identical" the way
+a true inpainting model would, that composite step is what actually
+enforces it. Output goes to mask_previews/{yolo_masked,gemini_masked,
+overlay}/.
 """
 import base64
 import io
@@ -177,15 +178,20 @@ def yolo_person_mask(image_bgr: np.ndarray) -> np.ndarray:
     return cv2.dilate(mask, kernel, iterations=1)
 
 
-def _to_gemini_b64(image_bgr: np.ndarray) -> str:
-    h, w = image_bgr.shape[:2]
-    img = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+def _pil_to_gemini_b64(image: Image.Image) -> str:
+    w, h = image.size
+    img = image
     if max(w, h) > GEMINI_MAX_DIM:
         scale = GEMINI_MAX_DIM / max(w, h)
         img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def _to_gemini_b64(image_bgr: np.ndarray) -> str:
+    """Legacy (process_image_masked) helper — takes an OpenCV BGR array."""
+    return _pil_to_gemini_b64(Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)))
 
 
 def _parse_gemini_json(text: str) -> list:
@@ -226,8 +232,86 @@ def _gemini_retry_delay(resp: httpx.Response, attempt: int) -> float:
     return min(2 ** attempt, GEMINI_MAX_RETRY_DELAY)  # 2s, 4s, 8s
 
 
+def _post_gemini_with_retry(payload: dict, gemini_key: str, model: str = GEMINI_DETECT_MODEL) -> httpx.Response:
+    """POST to Gemini's generateContent endpoint, retrying on transient
+    errors (see GEMINI_RETRY_STATUS / _gemini_retry_delay). Shared by both
+    the current and legacy pipelines' Gemini calls."""
+    resp = None
+    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+        resp = httpx.post(
+            f"{GEMINI_BASE_URL}/{model}:generateContent",
+            params={"key": gemini_key},
+            json=payload,
+            timeout=120.0,
+        )
+        if resp.status_code not in GEMINI_RETRY_STATUS or attempt == GEMINI_MAX_ATTEMPTS:
+            break
+        time.sleep(_gemini_retry_delay(resp, attempt))
+    resp.raise_for_status()
+    return resp
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Current (v2) pipeline: Gemini writes the removal prompt directly
+# ─────────────────────────────────────────────────────────────────────────
+
+GEMINI_REMOVAL_PROMPT_INSTRUCTION = """
+You are helping prepare a real estate property listing photo for publication.
+
+Look at this photo and identify anything that should be removed to make it look clean, professional, and market-ready: people (occupants, workers, visitors — even partially visible), clutter, trash, litter, cardboard boxes, sacks, tools, cleaning equipment, construction material, and visible dirt, stains, or debris on a floor, wall, or ground surface.
+
+Do NOT flag anything that is a permanent or semi-permanent part of the property: building structure, doors, windows, fixtures, furniture, appliances, built-ins, boundary walls/gates/fences, or vegetation.
+
+Write a short image-editing instruction (2-3 sentences, plain prose, no bullet points or JSON) addressed directly to an AI photo-editing model, telling it exactly what to remove from this photo and how to fill in those areas so the result looks natural, seamless, and professional. Also tell it to keep everything else in the photo unchanged, and to improve overall brightness, sharpness, and color accuracy.
+
+If nothing in the photo needs to be removed, respond with exactly the single word: NONE
+"""
+
+GEMINI_NOTHING_TO_REMOVE = "NONE"
+
+
+def gemini_generate_removal_prompt(gemini_key: str, image: Image.Image) -> Optional[str]:
+    """Send the image straight to Gemini (no YOLO, no bounding boxes) and
+    have it write a short natural-language editing instruction describing
+    what to remove, for use directly as Qwen's prompt. Returns None if
+    Gemini decides nothing needs removing."""
+    b64 = _pil_to_gemini_b64(image)
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                {"text": GEMINI_REMOVAL_PROMPT_INSTRUCTION},
+            ]
+        }],
+    }
+    resp = _post_gemini_with_retry(payload, gemini_key)
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    if text.strip(". \n").upper() == GEMINI_NOTHING_TO_REMOVE:
+        return None
+    return text
+
+
+GEMINI_PROMPT_DIR = MASK_PREVIEW_DIR / "gemini_prompt"
+
+
+def save_prompt_preview(name: str, removal_prompt: Optional[str]) -> Path:
+    """Saves Gemini's generated removal prompt (or a note that nothing was
+    flagged), independent of whether the Qwen call that follows succeeds —
+    so it can be checked on its own. Returns the directory written into."""
+    GEMINI_PROMPT_DIR.mkdir(parents=True, exist_ok=True)
+    (GEMINI_PROMPT_DIR / f"{Path(name).stem}.txt").write_text(
+        removal_prompt if removal_prompt else "(nothing flagged for removal)",
+        encoding="utf-8",
+    )
+    return MASK_PREVIEW_DIR
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Legacy pipeline: YOLO + Gemini bounding boxes -> merged mask -> overlay
+# ─────────────────────────────────────────────────────────────────────────
+
 def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndarray, list[str]]:
-    """Step 2: Gemini bounding-box detection of non-property items.
+    """Legacy step 2: Gemini bounding-box detection of non-property items.
     Returns (mask, detected_labels)."""
     h, w = image_bgr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
@@ -242,19 +326,7 @@ def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndar
         }],
         "generationConfig": {"responseMimeType": "application/json"},
     }
-
-    resp = None
-    for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
-        resp = httpx.post(
-            f"{GEMINI_BASE_URL}/{GEMINI_DETECT_MODEL}:generateContent",
-            params={"key": gemini_key},
-            json=payload,
-            timeout=120.0,
-        )
-        if resp.status_code not in GEMINI_RETRY_STATUS or attempt == GEMINI_MAX_ATTEMPTS:
-            break
-        time.sleep(_gemini_retry_delay(resp, attempt))
-    resp.raise_for_status()
+    resp = _post_gemini_with_retry(payload, gemini_key)
 
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
     detections = _parse_gemini_json(text)
@@ -322,8 +394,9 @@ def call_qwen(
     num_inference_steps: int = 40,
     timeout: float = 600.0,
 ) -> Image.Image:
-    """Step 4: send `image` (the overlay image — see process_image) + the
-    inpainting prompt to the Qwen server."""
+    """Send `image` + `prompt` to the Qwen server. Shared by both pipelines
+    (v2 passes the plain original + Gemini's generated prompt; the legacy
+    pipeline passes the overlay image + the fixed INPAINT_PROMPT)."""
     if not base_url or not base_url.strip() or "<pod-id>" in base_url:
         raise QwenNotConnectedError("Qwen on RunPod is not connected")
 
@@ -358,7 +431,7 @@ def composite(original: Image.Image, edited: Image.Image, mask: np.ndarray) -> I
     return Image.composite(edited, original, mask_img)
 
 
-def process_image(
+def process_image_masked(
     image: Image.Image,
     gemini_key: str,
     runpod_base_url: str,
@@ -366,7 +439,9 @@ def process_image(
     num_inference_steps: int = 40,
     name: str = "image",
 ) -> tuple[Image.Image, dict]:
-    """Runs the full pipeline on one already-opened PIL image.
+    """LEGACY pipeline (kept, not deleted — see module docstring). Not used
+    by the frontend by default; call this directly if you want the old
+    YOLO + Gemini-bounding-box + merged-mask + overlay + composite flow.
     Returns (result_image, debug_info). `name` is only used to name the
     saved preview files (see MASK_PREVIEW_DIR)."""
     if image.mode != "RGB":
@@ -405,5 +480,51 @@ def process_image(
         exc.debug_info = debug_info  # type: ignore[attr-defined]
         raise
     result = composite(image, edited, merged_mask)
+
+    return result, debug_info
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Current entry point — used by the frontend
+# ─────────────────────────────────────────────────────────────────────────
+
+def process_image(
+    image: Image.Image,
+    gemini_key: str,
+    runpod_base_url: str,
+    runpod_api_key: str,
+    num_inference_steps: int = 40,
+    name: str = "image",
+) -> tuple[Image.Image, dict]:
+    """Current (v2) pipeline: image -> Gemini (writes a short removal
+    prompt directly, no YOLO, no bounding boxes/mask) -> Qwen (edits the
+    image using that prompt). Qwen's output IS the final result — there's
+    no mask, so there's no composite step; the whole-image edit is trusted
+    directly. Returns (result_image, debug_info). `name` is only used to
+    name the saved preview file (see GEMINI_PROMPT_DIR)."""
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
+    removal_prompt = gemini_generate_removal_prompt(gemini_key, image)
+
+    # Save Gemini's generated prompt BEFORE the Qwen call, so it's there to
+    # inspect even if that call fails (e.g. the pod isn't connected yet).
+    preview_dir = save_prompt_preview(name, removal_prompt)
+    debug_info = {"removal_prompt": removal_prompt, "preview_dir": str(preview_dir)}
+
+    if removal_prompt is None:
+        # Gemini decided nothing needs removing — skip the Qwen call.
+        debug_info["skipped"] = True
+        return image, debug_info
+
+    debug_info["skipped"] = False
+    try:
+        result = call_qwen(runpod_base_url, runpod_api_key, image, removal_prompt, num_inference_steps)
+    except Exception as exc:
+        # Gemini's prompt was already generated and saved — attach that info
+        # to the exception so callers (e.g. the frontend) can still show it
+        # even though the pipeline didn't finish.
+        exc.debug_info = debug_info  # type: ignore[attr-defined]
+        raise
 
     return result, debug_info
