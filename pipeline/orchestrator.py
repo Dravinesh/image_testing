@@ -386,6 +386,13 @@ def save_mask_previews(
     return MASK_PREVIEW_DIR, overlay_image
 
 
+def format_elapsed(seconds: float) -> str:
+    """Human-readable elapsed time, e.g. 92.4 -> '1m 32.4s'."""
+    seconds = max(0.0, seconds)
+    minutes, secs = divmod(seconds, 60)
+    return f"{int(minutes)}m {secs:04.1f}s" if minutes >= 1 else f"{secs:.1f}s"
+
+
 def call_qwen(
     base_url: str,
     api_key: str,
@@ -443,7 +450,10 @@ def process_image_masked(
     by the frontend by default; call this directly if you want the old
     YOLO + Gemini-bounding-box + merged-mask + overlay + composite flow.
     Returns (result_image, debug_info). `name` is only used to name the
-    saved preview files (see MASK_PREVIEW_DIR)."""
+    saved preview files (see MASK_PREVIEW_DIR). debug_info["elapsed_seconds"]
+    / ["elapsed"] cover the whole call, same as process_image()."""
+    t0 = time.perf_counter()
+
     if image.mode != "RGB":
         image = image.convert("RGB")
     image_bgr = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
@@ -467,6 +477,8 @@ def process_image_masked(
     if not merged_mask.any():
         # Nothing flagged — skip the Qwen call and return the original as-is.
         debug_info["skipped"] = True
+        debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+        debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
         return image, debug_info
 
     debug_info["skipped"] = False
@@ -477,9 +489,13 @@ def process_image_masked(
         # YOLO/Gemini already ran and their output is saved — attach that
         # info to the exception so callers (e.g. the frontend) can still show
         # it even though the pipeline didn't finish.
+        debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+        debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
         exc.debug_info = debug_info  # type: ignore[attr-defined]
         raise
     result = composite(image, edited, merged_mask)
+    debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+    debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
 
     return result, debug_info
 
@@ -501,7 +517,14 @@ def process_image(
     image using that prompt). Qwen's output IS the final result — there's
     no mask, so there's no composite step; the whole-image edit is trusted
     directly. Returns (result_image, debug_info). `name` is only used to
-    name the saved preview file (see GEMINI_PROMPT_DIR)."""
+    name the saved preview file (see GEMINI_PROMPT_DIR).
+
+    debug_info["elapsed_seconds"] / ["elapsed"] cover the whole call — from
+    the moment the (already-uploaded) image is handed to this function
+    through to the final image coming back, i.e. Gemini's prompt-writing
+    time plus Qwen's generation time plus local overhead."""
+    t0 = time.perf_counter()
+
     if image.mode != "RGB":
         image = image.convert("RGB")
 
@@ -515,6 +538,8 @@ def process_image(
     if removal_prompt is None:
         # Gemini decided nothing needs removing — skip the Qwen call.
         debug_info["skipped"] = True
+        debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+        debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
         return image, debug_info
 
     debug_info["skipped"] = False
@@ -524,7 +549,11 @@ def process_image(
         # Gemini's prompt was already generated and saved — attach that info
         # to the exception so callers (e.g. the frontend) can still show it
         # even though the pipeline didn't finish.
+        debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+        debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
         exc.debug_info = debug_info  # type: ignore[attr-defined]
         raise
 
+    debug_info["elapsed_seconds"] = round(time.perf_counter() - t0, 2)
+    debug_info["elapsed"] = format_elapsed(debug_info["elapsed_seconds"])
     return result, debug_info

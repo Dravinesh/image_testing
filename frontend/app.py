@@ -116,6 +116,8 @@ with tab_batch:
                         st.caption("Gemini flagged nothing — left unchanged")
                     if item["status"] == "error" and item["info"].get("preview_dir"):
                         st.caption(f"Gemini's prompt saved — check `{item['info']['preview_dir']}/gemini_prompt/`")
+                    if item["info"].get("elapsed"):
+                        st.caption(f"⏱ {item['info']['elapsed']}")
 
         for ph, item in zip(placeholders, queue):
             render_item(ph, item)
