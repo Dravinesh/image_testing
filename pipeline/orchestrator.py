@@ -247,22 +247,32 @@ def save_mask_previews(
     return MASK_PREVIEW_DIR
 
 
+# Gemini can independently label a person too (e.g. "person", "man on
+# ladder") — when YOLO already flagged people, drop those from Gemini's list
+# so the prompt doesn't repeat itself (was producing "any people, person").
+_PERSON_SYNONYMS = {"person", "people", "human", "man", "woman", "occupant", "worker", "visitor"}
+
+
 def build_removal_prompt(gemini_labels: list[str], person_detected: bool) -> str:
     """Step 4 prep: since Qwen has no mask input, tell it in plain language
-    what to remove instead. The mask (from steps 1-3) is what actually
-    enforces the boundary afterward, in composite()."""
-    items = []
-    if person_detected:
-        items.append("any people")
-    items.extend(sorted(set(gemini_labels)))
+    what's already been marked for removal. Qwen's only job here is to fill
+    those areas in naturally — it doesn't decide what to remove, the mask
+    (from steps 1-3) already did, and composite() enforces that boundary
+    afterward regardless of what Qwen does elsewhere in the image."""
+    other_items = sorted({
+        label for label in gemini_labels
+        if not (person_detected and label.strip().lower() in _PERSON_SYNONYMS)
+    })
+    items = (["people"] if person_detected else []) + other_items
     items_text = ", ".join(items) if items else "clutter, trash, and temporary objects"
 
     return (
         "PROPERTY LISTING PHOTO CLEANUP.\n"
-        f"Remove the following from this photo: {items_text}.\n"
-        "Fill the removed areas seamlessly, matching the exact texture, color, "
-        "pattern, lighting, and shadow of the immediately surrounding area, so "
-        "it looks like they were never there.\n"
+        f"The following have already been marked for removal: {items_text}.\n"
+        "Your only task is to fill in those marked areas naturally — match "
+        "the exact texture, color, pattern, lighting, and shadow of the "
+        "immediately surrounding area, so it looks like they were never "
+        "there. Do not add, remove, or restyle anything else.\n"
         "Keep everything else in the photo exactly unchanged: the building "
         "structure, walls, floors, furniture, fixtures, windows, doors, "
         "vegetation, and the overall composition, perspective, and lighting "
