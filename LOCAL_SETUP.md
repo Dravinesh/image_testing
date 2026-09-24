@@ -89,7 +89,12 @@ Opens `http://localhost:8501` (or the next free port if that one's taken). The s
 3. Each thumbnail's status icon updates live: ⏳ pending → 🔄 processing → ✅ done (something was removed) / ➖ skipped (nothing flagged) / ❌ error.
 4. Finished results are saved into the **`results/`** folder at the project root, named `<original-filename>_cleaned.png`.
 
-**Testing YOLO + Gemini without the pod connected:** only a Gemini API key is required to click **Process Queue** — the Qwen URL is optional. Steps 1-3 (YOLO person masking, Gemini clutter detection, mask merging) always run and save their output to the **`mask_previews/`** folder — `<name>_1_yolo_person_mask.png`, `<name>_2_gemini_clutter_mask.png`, `<name>_3_merged_mask.png`, `<name>_4_overlay.png` (the merged mask drawn as a red overlay on the original — the fastest way to eyeball whether the right things got flagged), and `<name>_labels.txt` (what Gemini detected). If the Qwen URL isn't set (or the pod isn't reachable), each image ends with a `❌ Qwen on RunPod is not connected` status — that's expected in this case, not a bug; check `mask_previews/` to confirm YOLO/Gemini worked regardless.
+**Testing YOLO + Gemini without the pod connected:** only a Gemini API key is required to click **Process Queue** — the Qwen URL is optional. Steps 1-3 (YOLO person masking, Gemini clutter detection, mask merging) always run and save their output into **`mask_previews/`**, in subfolders:
+- `mask_previews/yolo_masked/<name>.png` — YOLO's raw person mask
+- `mask_previews/gemini_masked/<name>.png` — Gemini's raw clutter mask, plus `<name>_labels.txt` (what it detected)
+- `mask_previews/overlay/<name>.png` — the merged mask drawn as a red overlay on the original (the fastest way to eyeball whether the right things got flagged), plus `<name>_mask.png` (the raw merged mask). **This overlay image is also what actually gets sent to Qwen** — not the plain original — so this folder doubles as "what Qwen sees."
+
+If the Qwen URL isn't set (or the pod isn't reachable), each image ends with a `❌ Qwen on RunPod is not connected` status — that's expected in this case, not a bug; check `mask_previews/` to confirm YOLO/Gemini worked regardless.
 
 ### Single Test tab (Phase 1 — raw Qwen only)
 Sends your image + your own typed prompt straight to the Qwen server, no YOLO/Gemini/masking involved. Useful for testing the pod itself in isolation.
