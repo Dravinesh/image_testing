@@ -202,6 +202,28 @@ def _parse_gemini_json(text: str) -> list:
 # typically transient, unlike e.g. a 400 (bad request) or 403 (bad key).
 GEMINI_RETRY_STATUS = {429, 500, 502, 503, 504}
 GEMINI_MAX_ATTEMPTS = 4
+GEMINI_MAX_RETRY_DELAY = 60.0  # cap, in case a reported/derived delay is huge
+
+
+def _gemini_retry_delay(resp: httpx.Response, attempt: int) -> float:
+    """How long to wait before the next attempt. Google's standard API error
+    body can include a RetryInfo.retryDelay (e.g. {"error": {"details": [
+    {"@type": ".../google.rpc.RetryInfo", "retryDelay": "34s"}]}}) — honor
+    that if present, since it's Google telling us exactly how long its rate
+    limit window has left. Otherwise fall back to backoff: 429 (quota/rate
+    limit — usually a per-minute window, so a couple of seconds won't help)
+    gets a longer wait than a transient 5xx blip."""
+    try:
+        for detail in resp.json().get("error", {}).get("details", []):
+            if detail.get("@type", "").endswith("RetryInfo"):
+                delay_str = detail.get("retryDelay", "")
+                if delay_str.endswith("s"):
+                    return min(float(delay_str[:-1]), GEMINI_MAX_RETRY_DELAY)
+    except (ValueError, KeyError, json.JSONDecodeError):
+        pass
+    if resp.status_code == 429:
+        return min(15.0 * attempt, GEMINI_MAX_RETRY_DELAY)  # 15s, 30s, 45s
+    return min(2 ** attempt, GEMINI_MAX_RETRY_DELAY)  # 2s, 4s, 8s
 
 
 def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndarray, list[str]]:
@@ -231,7 +253,7 @@ def gemini_clutter_mask(gemini_key: str, image_bgr: np.ndarray) -> tuple[np.ndar
         )
         if resp.status_code not in GEMINI_RETRY_STATUS or attempt == GEMINI_MAX_ATTEMPTS:
             break
-        time.sleep(2 ** attempt)  # 2s, 4s, 8s between attempts 1-2, 2-3, 3-4
+        time.sleep(_gemini_retry_delay(resp, attempt))
     resp.raise_for_status()
 
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
